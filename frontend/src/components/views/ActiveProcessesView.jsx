@@ -3,6 +3,8 @@ import { Cpu, RefreshCw, XCircle, Search, AlertTriangle, Activity, Loader2, Info
 import { useTranslation, Trans } from 'react-i18next'
 import { cn, isPS5 } from '../../utils/helpers'
 
+const isCriticalProcess = (name) => name === 'pldmgr.elf' || name === 'elfldr.elf'
+
 const ActiveProcessesView = ({ ip, addToast, showConfirm }) => {
   const { t } = useTranslation()
   const [processes, setProcesses] = useState([])
@@ -10,6 +12,7 @@ const ActiveProcessesView = ({ ip, addToast, showConfirm }) => {
   const [error, setError] = useState(false)
   const [showAll, setShowAll] = useState(false)
   const [search, setSearch] = useState('')
+  const [killingAll, setKillingAll] = useState(false)
 
   const fetchProcesses = async (isBackground = false) => {
     if (!isBackground) setLoading(true)
@@ -32,7 +35,7 @@ const ActiveProcessesView = ({ ip, addToast, showConfirm }) => {
 
   useEffect(() => {
     fetchProcesses()
-    
+
     const intervalId = setInterval(() => {
       fetchProcesses(true)
     }, 15000)
@@ -52,9 +55,13 @@ const ActiveProcessesView = ({ ip, addToast, showConfirm }) => {
     return result
   }, [processes, showAll, search])
 
+  const killableProcesses = useMemo(
+    () => filteredProcesses.filter(p => !isCriticalProcess(p.name)),
+    [filteredProcesses]
+  )
+
   const handleKill = (proc) => {
-    const isCritical = proc.name === 'pldmgr.elf' || proc.name === 'elfldr.elf';
-    if (isCritical) {
+    if (isCriticalProcess(proc.name)) {
       addToast(t("active_processes.cannot_kill", "Cannot kill {{name}}", { name: proc.name }), "error")
       return
     }
@@ -76,6 +83,57 @@ const ActiveProcessesView = ({ ip, addToast, showConfirm }) => {
         } catch (e) {
           addToast(t("active_processes.kill_error", "Error killing {{name}}", { name: proc.name }), "error")
         }
+      }
+    )
+  }
+
+  const handleKillAll = () => {
+    const targets = killableProcesses
+    if (targets.length === 0) return
+
+    const baseMsg = t(
+      "active_processes.kill_all_message",
+      "Are you sure you want to kill {{total}} process(es)?",
+      { total: targets.length }
+    )
+    const warning = showAll
+      ? " " + t(
+          "active_processes.kill_all_warning",
+          "This includes system processes and may crash or freeze your console."
+        )
+      : ""
+
+    showConfirm(
+      t("active_processes.kill_all_modal_title", "Kill All Processes"),
+      baseMsg + warning,
+      async () => {
+        setKillingAll(true)
+        const killed = new Set()
+
+        // Sequential on purpose: keeps load on the console's small HTTP server low
+        for (const proc of targets) {
+          try {
+            const res = await fetch(`/process_kill?pid=${proc.pid}`)
+            if (res.ok) killed.add(proc.pid)
+          } catch {
+            /* counted as failed below */
+          }
+        }
+
+        setProcesses(prev => prev.filter(p => !killed.has(p.pid)))
+
+        const failed = targets.length - killed.size
+        if (failed === 0) {
+          addToast(t("active_processes.kill_all_success", "Killed {{count}} processes", { count: killed.size }))
+        } else {
+          addToast(
+            t("active_processes.kill_all_partial", "Killed {{killed}}, failed to kill {{failed}}", { killed: killed.size, failed }),
+            "error"
+          )
+        }
+
+        setKillingAll(false)
+        setTimeout(() => fetchProcesses(true), 1000)
       }
     )
   }
@@ -130,7 +188,7 @@ const ActiveProcessesView = ({ ip, addToast, showConfirm }) => {
           <div className="py-12 bg-red-500/10 border border-red-500/20 rounded-2xl flex flex-col items-center justify-center space-y-4">
             <AlertTriangle className="w-10 h-10 text-red-500" />
             <p className="text-red-400 font-bold">{t("active_processes.error_loading", "Failed to load processes")}</p>
-            <button onClick={fetchProcesses} className="px-6 py-2 bg-red-500 hover:bg-red-400 text-white rounded-xl font-bold transition-colors">
+            <button onClick={() => fetchProcesses()} className="px-6 py-2 bg-red-500 hover:bg-red-400 text-white rounded-xl font-bold transition-colors">
               {t("active_processes.retry", "Retry")}
             </button>
           </div>
@@ -140,41 +198,61 @@ const ActiveProcessesView = ({ ip, addToast, showConfirm }) => {
             <p className="text-zinc-500 font-bold text-lg">{t("active_processes.no_processes", "No processes found")}</p>
           </div>
         ) : (
-          <div className="grid grid-cols-1 gap-4">
-            {filteredProcesses.map((p) => {
-              const critical = p.name === 'pldmgr.elf' || p.name === 'elfldr.elf';
-              return (
-                <div key={p.pid} className={cn(
-                  "glass-card p-4 md:p-6 rounded-2xl flex flex-row items-center justify-between gap-4 border-white/10 hover:border-ps-blue/20 transition-all bg-white/[0.01]"
-                )}>
-                  <div className="flex items-center space-x-4 min-w-0 flex-1">
-                    <div className={cn(
-                      "p-3 rounded-xl flex-shrink-0",
-                      p.is_daemon ? "bg-ps-blue/10 text-ps-blue" : "bg-white/5 text-zinc-400"
-                    )}>
-                      <Cpu className="w-6 h-6" />
-                    </div>
-                    <div className="min-w-0 flex-1 space-y-1">
-                      <h3 className="text-xl font-bold text-white truncate">{p.name}</h3>
-                      <div className="flex items-center space-x-4 text-xs font-mono text-zinc-500 uppercase tracking-wider">
-                        <span>PID: <span className="text-zinc-300">{p.pid}</span></span>
-                        <span>MEM: <span className="text-zinc-300">{p.memory.toFixed(1)} MiB</span></span>
+          <>
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-mono uppercase tracking-wider text-zinc-500">
+                {t("active_processes.showing_count", "{{total}} processes", { total: filteredProcesses.length })}
+              </span>
+              <button
+                onClick={handleKillAll}
+                disabled={killingAll || killableProcesses.length === 0}
+                className="px-4 py-2 bg-red-500 hover:bg-red-400 text-white rounded-xl font-bold text-sm transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center space-x-2"
+              >
+                {killingAll
+                  ? <Loader2 className="w-4 h-4 animate-spin" />
+                  : <XCircle className="w-4 h-4" />}
+                <span>
+                  {t("active_processes.kill_all_button", "Kill All")} ({killableProcesses.length})
+                </span>
+              </button>
+            </div>
+
+            <div className="grid grid-cols-1 gap-4">
+              {filteredProcesses.map((p) => {
+                const critical = isCriticalProcess(p.name);
+                return (
+                  <div key={p.pid} className={cn(
+                    "glass-card p-4 md:p-6 rounded-2xl flex flex-row items-center justify-between gap-4 border-white/10 hover:border-ps-blue/20 transition-all bg-white/[0.01]"
+                  )}>
+                    <div className="flex items-center space-x-4 min-w-0 flex-1">
+                      <div className={cn(
+                        "p-3 rounded-xl flex-shrink-0",
+                        p.is_daemon ? "bg-ps-blue/10 text-ps-blue" : "bg-white/5 text-zinc-400"
+                      )}>
+                        <Cpu className="w-6 h-6" />
+                      </div>
+                      <div className="min-w-0 flex-1 space-y-1">
+                        <h3 className="text-xl font-bold text-white truncate">{p.name}</h3>
+                        <div className="flex items-center space-x-4 text-xs font-mono text-zinc-500 uppercase tracking-wider">
+                          <span>PID: <span className="text-zinc-300">{p.pid}</span></span>
+                          <span>MEM: <span className="text-zinc-300">{p.memory.toFixed(1)} MiB</span></span>
+                        </div>
                       </div>
                     </div>
+                    <button
+                      onClick={() => handleKill(p)}
+                      disabled={critical || killingAll}
+                      className="px-4 py-2 bg-red-500/10 hover:bg-red-500 text-red-500 hover:text-white rounded-xl font-bold text-sm transition-all disabled:opacity-30 disabled:cursor-not-allowed group-hover:opacity-100 opacity-50 flex items-center space-x-2"
+                      title={critical ? t("active_processes.cannot_kill_tooltip", "Cannot kill critical process") : t("active_processes.kill_button", "Kill")}
+                    >
+                      <Trash2 className="w-4 h-4" />
+                      <span className="hidden sm:inline">{t("active_processes.kill_button", "Kill")}</span>
+                    </button>
                   </div>
-                  <button
-                    onClick={() => handleKill(p)}
-                    disabled={critical}
-                    className="px-4 py-2 bg-red-500/10 hover:bg-red-500 text-red-500 hover:text-white rounded-xl font-bold text-sm transition-all disabled:opacity-30 disabled:cursor-not-allowed group-hover:opacity-100 opacity-50 flex items-center space-x-2"
-                    title={critical ? t("active_processes.cannot_kill_tooltip", "Cannot kill critical process") : t("active_processes.kill_button", "Kill")}
-                  >
-                    <Trash2 className="w-4 h-4" />
-                    <span className="hidden sm:inline">{t("active_processes.kill_button", "Kill")}</span>
-                  </button>
-                </div>
-              )
-            })}
-          </div>
+                )
+              })}
+            </div>
+          </>
         )}
 
         <div className="flex items-start space-x-3 text-zinc-500 text-sm p-6 glass-card rounded-2xl border-white/5 bg-white/[0.01]">
