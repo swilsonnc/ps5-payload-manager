@@ -4,6 +4,8 @@
 #include <strings.h>
 #include <unistd.h>
 #include <signal.h>
+#include <errno.h>
+#include <time.h>
 #include <sys/types.h>
 #include <sys/proc.h>
 #include <sys/user.h>
@@ -15,6 +17,8 @@
 #include "pldmgr.h"
 
 #define MiB(x) ((x) / (1024.0 * 1024))
+#define TERM_GRACE_MS     3000  /* time to wait after SIGTERM before SIGKILL */
+#define POLL_INTERVAL_MS  50
 
 typedef struct app_info {
     uint32_t app_id;
@@ -88,14 +92,30 @@ size_t process_list_json(char *buf, size_t max_size) {
     return jb.pos;
 }
 
+static int process_exists(pid_t pid) {
+    if (kill(pid, 0) == 0) return 1;
+    return (errno == EPERM);    /* exists, but we can't signal it */
+}
+
 int process_kill(int pid) {
-    if (pid <= 0) return -1; /* Prevent killing kernel or init */
+    if (pid <= 1) return -1;    /* Prevent killing kernel (0) or init (1), and invalid/negative pids */
 
     /* Prevent killing our own process */
     if (pid == getpid()) return -1;
 
-    if (kill(pid, SIGKILL) == 0) {
-        return 0;
+    /* 1. Ask the process to exit cleanly */
+    if (kill(pid, SIGTERM) != 0) {
+        return (errno == ESRCH) ? 0 : -1;   /* already gone vs. real error */
     }
+
+    /* 2. Give it time to shut down */
+    struct timespec ts = { 0, POLL_INTERVAL_MS * 1000000L };
+    for (int waited = 0; waited < TERM_GRACE_MS; waited += POLL_INTERVAL_MS) {
+        if (!process_exists(pid)) return 0;
+        nanosleep(&ts, NULL);
+    }
+
+    /* 3. Still running, force kill */
+    if (kill(pid, SIGKILL) == 0 || errno == ESRCH) return 0;
     return -1;
 }
