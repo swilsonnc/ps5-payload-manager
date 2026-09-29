@@ -11,7 +11,6 @@
 #include <sys/user.h>
 #include <sys/sysctl.h>
 #include <stdint.h>
-
 #include "process_mgr.h"
 #include "json_helpers.h"
 #include "pldmgr.h"
